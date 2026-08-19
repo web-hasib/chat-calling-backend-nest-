@@ -13,7 +13,7 @@ import { ChatService } from './chat.service';
 
 @WebSocketGateway({
   cors: {
-    origin: ['http://localhost:3000', 'http://localhost:3001', 'http://127.0.0.1:3000','https://231dpltn-3000.inc1.devtunnels.ms'],
+    origin: '*',
     credentials: false,
   },
 })
