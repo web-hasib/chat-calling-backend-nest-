@@ -1,0 +1,118 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider     = "prisma-client-js"
+  moduleFormat = "cjs"
+}
+
+model User {
+  id            String                  @id @default(uuid())
+  email         String                  @unique
+  username      String                  @unique
+  password      String?
+  name          String?
+  avatarUrl     String?
+  pushNotificationsEnabled Boolean?      @default(true)
+  soundEffectsEnabled      Boolean?      @default(true)
+  messageTone              String?       @default("chime")
+  callTone                 String?       @default("classic")
+  createdAt     DateTime                @default(now())
+  updatedAt     DateTime                @updatedAt
+  conversations ConversationParticipant[]
+  messages      Message[]
+  reactions     MessageReaction[]
+  callsSent     CallLog[]               @relation("Caller")
+  callsReceived CallLog[]               @relation("Receiver")
+}
+
+model Conversation {
+  id            String                    @id @default(uuid())
+  isGroup       Boolean                   @default(false)
+  name          String?
+  avatarUrl     String?
+  inviteCode    String?                   @unique
+  themeColor    String?                   @default("#0084FF")
+  themeGradient String?
+  bgImage       String?
+  defaultEmoji  String?                   @default("👍")
+  createdAt     DateTime                  @default(now())
+  participants  ConversationParticipant[]
+  messages      Message[]
+  calls         CallLog[]
+}
+
+model ConversationParticipant {
+  id             String       @id @default(uuid())
+  userId         String
+  conversationId String
+  nickname       String?
+  role           String       @default("MEMBER")
+  joinedAt       DateTime     @default(now())
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, conversationId])
+}
+
+model Message {
+  id             String            @id @default(uuid())
+  content        String?
+  fileUrl        String?
+  fileType       String?
+  isRead         Boolean           @default(false)
+  isSystem       Boolean           @default(false)
+  isDeleted      Boolean           @default(false)
+  deletedFor     String[]          @default([])
+  readAt         DateTime?
+  replyToId      String?
+  replyTo        Message?          @relation("MessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies        Message[]         @relation("MessageReplies")
+  reactions      MessageReaction[]
+  linkPreview    Json?
+  createdAt      DateTime          @default(now())
+  senderId       String
+  conversationId String
+  sender         User              @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  conversation   Conversation      @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+}
+
+model MessageReaction {
+  id        String   @id @default(uuid())
+  emoji     String
+  userId    String
+  messageId String
+  createdAt DateTime @default(now())
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId])
+}
+
+model CallLog {
+  id             String       @id @default(uuid())
+  type           CallType
+  status         CallStatus
+  duration       Int?
+  createdAt      DateTime     @default(now())
+  callerId       String
+  receiverId     String
+  conversationId String
+  caller         User         @relation("Caller", fields: [callerId], references: [id])
+  receiver       User         @relation("Receiver", fields: [receiverId], references: [id])
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+}
+
+enum CallType {
+  AUDIO
+  VIDEO
+}
+
+enum CallStatus {
+  MISSED
+  COMPLETED
+  REJECTED
+  BUSY
+}
