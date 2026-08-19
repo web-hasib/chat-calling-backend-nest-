@@ -21,8 +21,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server: Server;
 
-  // Track active socket connections by User ID
-  private activeUsers = new Map<string, string>(); // userId -> socketId
+  // Track active socket connections by User ID (supports multiple tabs/devices)
+  private activeUsers = new Map<string, Set<string>>(); // userId -> Set of socketIds
 
   // Track active group calls: conversationId -> { type, participants, startedAt, messages }
   private activeGroupCalls = new Map<string, { type: 'AUDIO' | 'VIDEO'; participants: Set<string>; startedAt: number; messages: any[] }>();
@@ -33,6 +33,20 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private chatService: ChatService,
   ) {
     this.MAX_GROUP_CALL_PARTICIPANTS = parseInt(process.env.MAX_GROUP_CALL_PARTICIPANTS || '100', 10);
+  }
+
+  /**
+   * Helper to broadcast an event to all connected sockets of a target user
+   */
+  private sendToUser(userId: string, event: string, payload: any): boolean {
+    const sockets = this.activeUsers.get(userId);
+    if (sockets && sockets.size > 0) {
+      for (const socketId of sockets) {
+        this.server.to(socketId).emit(event, payload);
+      }
+      return true;
+    }
+    return false;
   }
 
   async handleConnection(client: Socket) {
@@ -48,7 +62,12 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       const userId = payload.sub;
 
       client.data.userId = userId;
-      this.activeUsers.set(userId, client.id);
+      let userSockets = this.activeUsers.get(userId);
+      if (!userSockets) {
+        userSockets = new Set<string>();
+        this.activeUsers.set(userId, userSockets);
+      }
+      userSockets.add(client.id);
 
       // Send list of currently online user IDs to the newly connected client
       client.emit('online-users-list', Array.from(this.activeUsers.keys()));
@@ -63,40 +82,42 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   handleDisconnect(client: Socket) {
     const userId = client.data.userId;
     if (userId) {
-      this.activeUsers.delete(userId);
-      this.server.emit('user-status', { userId, status: 'offline' });
+      const userSockets = this.activeUsers.get(userId);
+      if (userSockets) {
+        userSockets.delete(client.id);
+        if (userSockets.size === 0) {
+          this.activeUsers.delete(userId);
+          this.server.emit('user-status', { userId, status: 'offline' });
+        }
+      }
 
-      // Cleanup group calls: remove user from any active group call and notify peers
-      for (const [convoId, groupCall] of this.activeGroupCalls.entries()) {
-        if (groupCall.participants.has(userId)) {
-          groupCall.participants.delete(userId);
+      // Cleanup group calls: remove user from any active group call if no remaining active connections
+      if (!this.activeUsers.has(userId)) {
+        for (const [convoId, groupCall] of this.activeGroupCalls.entries()) {
+          if (groupCall.participants.has(userId)) {
+            groupCall.participants.delete(userId);
 
-          // Notify remaining participants
-          for (const peerId of groupCall.participants) {
-            const peerSocketId = this.activeUsers.get(peerId);
-            if (peerSocketId) {
-              this.server.to(peerSocketId).emit('group-call-user-left', {
+            // Notify remaining participants
+            for (const peerId of groupCall.participants) {
+              this.sendToUser(peerId, 'group-call-user-left', {
                 userId,
                 conversationId: convoId,
               });
             }
-          }
 
-          // If call is now empty or only 1 person left, end it completely
-          if (groupCall.participants.size <= 1) {
-            for (const lastPeerId of groupCall.participants) {
-              const lastSocket = this.activeUsers.get(lastPeerId);
-              if (lastSocket) {
-                this.server.to(lastSocket).emit('group-call-ended', {
+            // If call is now empty or only 1 person left, end it completely
+            if (groupCall.participants.size <= 1) {
+              for (const lastPeerId of groupCall.participants) {
+                this.sendToUser(lastPeerId, 'group-call-ended', {
                   conversationId: convoId,
                 });
               }
+              this.activeGroupCalls.delete(convoId);
             }
-            this.activeGroupCalls.delete(convoId);
-          }
 
-          // Broadcast updated call status to all participants in conversation
-          this.broadcastGroupCallStatus(convoId);
+            // Broadcast updated call status to all participants in conversation
+            this.broadcastGroupCallStatus(convoId);
+          }
         }
       }
     }
@@ -242,18 +263,16 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: { to: string; offer: any; type: 'AUDIO' | 'VIDEO'; conversationId: string; callerName?: string; callerAvatar?: string }
   ) {
     const fromUserId = client.data.userId;
-    const receiverSocketId = this.activeUsers.get(data.to);
+    const sent = this.sendToUser(data.to, 'incoming-call', {
+      from: fromUserId,
+      offer: data.offer,
+      type: data.type,
+      conversationId: data.conversationId,
+      callerName: data.callerName,
+      callerAvatar: data.callerAvatar,
+    });
 
-    if (receiverSocketId) {
-      this.server.to(receiverSocketId).emit('incoming-call', {
-        from: fromUserId,
-        offer: data.offer,
-        type: data.type,
-        conversationId: data.conversationId,
-        callerName: data.callerName,
-        callerAvatar: data.callerAvatar,
-      });
-    } else {
+    if (!sent) {
       client.emit('call-failed', { reason: 'User offline' });
       // Log missed call
       this.chatService.logCall(fromUserId, data.to, data.conversationId, data.type, 'MISSED', 0).then((res) => {
@@ -270,12 +289,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { to: string; answer: any }
   ) {
-    const senderSocketId = this.activeUsers.get(data.to);
-    if (senderSocketId) {
-      this.server.to(senderSocketId).emit('call-accepted', {
-        answer: data.answer,
-      });
-    }
+    this.sendToUser(data.to, 'call-accepted', {
+      answer: data.answer,
+    });
   }
 
   @SubscribeMessage('ice-candidate')
@@ -283,12 +299,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { to: string; candidate: any }
   ) {
-    const receiverSocketId = this.activeUsers.get(data.to);
-    if (receiverSocketId) {
-      this.server.to(receiverSocketId).emit('ice-candidate', {
-        candidate: data.candidate,
-      });
-    }
+    this.sendToUser(data.to, 'ice-candidate', {
+      candidate: data.candidate,
+    });
   }
 
   @SubscribeMessage('reject-call')
@@ -296,10 +309,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { to: string; conversationId: string; type: 'AUDIO' | 'VIDEO'; reason?: string }
   ) {
-    const callerSocketId = this.activeUsers.get(data.to);
-    if (callerSocketId) {
-      this.server.to(callerSocketId).emit('call-rejected', { reason: data.reason });
-    }
+    this.sendToUser(data.to, 'call-rejected', { reason: data.reason });
     const userId = client.data.userId;
     const status = data.reason === 'busy' ? 'BUSY' : 'REJECTED';
     this.chatService.logCall(data.to, userId, data.conversationId, data.type, status, 0).then((res) => {
@@ -315,10 +325,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { to: string; conversationId: string; type: 'AUDIO' | 'VIDEO'; duration: number }
   ) {
-    const targetSocketId = this.activeUsers.get(data.to);
-    if (targetSocketId) {
-      this.server.to(targetSocketId).emit('call-ended');
-    }
+    this.sendToUser(data.to, 'call-ended', {});
     const userId = client.data.userId;
     this.chatService.logCall(userId, data.to, data.conversationId, data.type, 'COMPLETED', data.duration).then((res) => {
       if (res?.systemMessage) {
@@ -346,10 +353,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // Broadcast call status to all participants of this conversation
     for (const p of conversation.participants) {
-      const peerSocketId = this.activeUsers.get(p.userId);
-      if (peerSocketId) {
-        this.server.to(peerSocketId).emit(`group-call-status-${conversationId}`, data);
-      }
+      this.sendToUser(p.userId, `group-call-status-${conversationId}`, data);
     }
   }
 
@@ -396,19 +400,16 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // Notify all other online participants
     for (const p of conversation.participants) {
       if (p.userId === userId) continue;
-      const peerSocketId = this.activeUsers.get(p.userId);
-      if (peerSocketId) {
-        this.server.to(peerSocketId).emit('group-call-incoming', {
-          conversationId: data.conversationId,
-          type: data.type,
-          initiatorId: userId,
-          initiatorName,
-          initiatorAvatar,
-          initiatorRole,
-          groupName: conversation.name || 'Group',
-          startedAt,
-        });
-      }
+      this.sendToUser(p.userId, 'group-call-incoming', {
+        conversationId: data.conversationId,
+        type: data.type,
+        initiatorId: userId,
+        initiatorName,
+        initiatorAvatar,
+        initiatorRole,
+        groupName: conversation.name || 'Group',
+        startedAt,
+      });
     }
 
     // Broadcast call status to everyone in the conversation
@@ -483,16 +484,13 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // Notify existing participants that a new user joined
     for (const peerId of existingParticipantIds) {
-      const peerSocketId = this.activeUsers.get(peerId);
-      if (peerSocketId) {
-        this.server.to(peerSocketId).emit('group-call-user-joined', {
-          conversationId: data.conversationId,
-          userId,
-          name: joinerName,
-          avatarUrl: joinerAvatar,
-          role: joinerRole,
-        });
-      }
+      this.sendToUser(peerId, 'group-call-user-joined', {
+        conversationId: data.conversationId,
+        userId,
+        name: joinerName,
+        avatarUrl: joinerAvatar,
+        role: joinerRole,
+      });
     }
 
     // Broadcast updated status
@@ -508,14 +506,11 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: { to: string; offer: any; conversationId: string }
   ) {
     const fromUserId = client.data.userId;
-    const targetSocketId = this.activeUsers.get(data.to);
-    if (targetSocketId) {
-      this.server.to(targetSocketId).emit('group-call-offer', {
-        from: fromUserId,
-        offer: data.offer,
-        conversationId: data.conversationId,
-      });
-    }
+    this.sendToUser(data.to, 'group-call-offer', {
+      from: fromUserId,
+      offer: data.offer,
+      conversationId: data.conversationId,
+    });
   }
 
   /**
@@ -527,14 +522,11 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: { to: string; answer: any; conversationId: string }
   ) {
     const fromUserId = client.data.userId;
-    const targetSocketId = this.activeUsers.get(data.to);
-    if (targetSocketId) {
-      this.server.to(targetSocketId).emit('group-call-answer', {
-        from: fromUserId,
-        answer: data.answer,
-        conversationId: data.conversationId,
-      });
-    }
+    this.sendToUser(data.to, 'group-call-answer', {
+      from: fromUserId,
+      answer: data.answer,
+      conversationId: data.conversationId,
+    });
   }
 
   /**
@@ -546,14 +538,11 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: { to: string; candidate: any; conversationId: string }
   ) {
     const fromUserId = client.data.userId;
-    const targetSocketId = this.activeUsers.get(data.to);
-    if (targetSocketId) {
-      this.server.to(targetSocketId).emit('group-ice-candidate', {
-        from: fromUserId,
-        candidate: data.candidate,
-        conversationId: data.conversationId,
-      });
-    }
+    this.sendToUser(data.to, 'group-ice-candidate', {
+      from: fromUserId,
+      candidate: data.candidate,
+      conversationId: data.conversationId,
+    });
   }
 
   /**
@@ -575,24 +564,18 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // Notify remaining participants
     for (const peerId of groupCall.participants) {
-      const peerSocketId = this.activeUsers.get(peerId);
-      if (peerSocketId) {
-        this.server.to(peerSocketId).emit('group-call-user-left', {
-          userId,
-          conversationId: data.conversationId,
-        });
-      }
+      this.sendToUser(peerId, 'group-call-user-left', {
+        userId,
+        conversationId: data.conversationId,
+      });
     }
 
     // If call is now empty or only 1 person left, end it completely
     if (groupCall.participants.size <= 1) {
       for (const lastPeerId of groupCall.participants) {
-        const lastSocket = this.activeUsers.get(lastPeerId);
-        if (lastSocket) {
-          this.server.to(lastSocket).emit('group-call-ended', {
-            conversationId: data.conversationId,
-          });
-        }
+        this.sendToUser(lastPeerId, 'group-call-ended', {
+          conversationId: data.conversationId,
+        });
       }
       this.activeGroupCalls.delete(data.conversationId);
 
@@ -650,14 +633,11 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // Relay to other participants
     for (const peerId of groupCall.participants) {
       if (peerId === userId) continue;
-      const peerSocketId = this.activeUsers.get(peerId);
-      if (peerSocketId) {
-        this.server.to(peerSocketId).emit('group-call-emoji-received', {
-          userId,
-          emoji: data.emoji,
-          conversationId: data.conversationId,
-        });
-      }
+      this.sendToUser(peerId, 'group-call-emoji-received', {
+        userId,
+        emoji: data.emoji,
+        conversationId: data.conversationId,
+      });
     }
   }
 
@@ -687,10 +667,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // Relay to other participants
     for (const peerId of groupCall.participants) {
       if (peerId === userId) continue;
-      const peerSocketId = this.activeUsers.get(peerId);
-      if (peerSocketId) {
-        this.server.to(peerSocketId).emit('group-call-chat-message-received', msg);
-      }
+      this.sendToUser(peerId, 'group-call-chat-message-received', msg);
     }
   }
 
@@ -711,18 +688,15 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // Relay to other participants
     for (const peerId of groupCall.participants) {
       if (peerId === userId) continue;
-      const peerSocketId = this.activeUsers.get(peerId);
-      if (peerSocketId) {
-        this.server.to(peerSocketId).emit('group-call-media-state-received', {
-          userId,
-          videoEnabled: data.videoEnabled,
-          audioEnabled: data.audioEnabled,
-          handRaised: data.handRaised,
-          footRaised: data.footRaised,
-          isScreenSharing: data.isScreenSharing,
-          conversationId: data.conversationId,
-        });
-      }
+      this.sendToUser(peerId, 'group-call-media-state-received', {
+        userId,
+        videoEnabled: data.videoEnabled,
+        audioEnabled: data.audioEnabled,
+        handRaised: data.handRaised,
+        footRaised: data.footRaised,
+        isScreenSharing: data.isScreenSharing,
+        conversationId: data.conversationId,
+      });
     }
   }
 
@@ -749,12 +723,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // Emit 'group-call-force-muted' to the target user if they are in the call
     if (groupCall.participants.has(data.targetUserId)) {
-      const targetSocketId = this.activeUsers.get(data.targetUserId);
-      if (targetSocketId) {
-        this.server.to(targetSocketId).emit('group-call-force-muted', {
-          conversationId: data.conversationId,
-        });
-      }
+      this.sendToUser(data.targetUserId, 'group-call-force-muted', {
+        conversationId: data.conversationId,
+      });
     }
   }
 
@@ -781,12 +752,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // Emit 'group-call-force-unmuted' to the target user if they are in the call
     if (groupCall.participants.has(data.targetUserId)) {
-      const targetSocketId = this.activeUsers.get(data.targetUserId);
-      if (targetSocketId) {
-        this.server.to(targetSocketId).emit('group-call-force-unmuted', {
-          conversationId: data.conversationId,
-        });
-      }
+      this.sendToUser(data.targetUserId, 'group-call-force-unmuted', {
+        conversationId: data.conversationId,
+      });
     }
   }
 
@@ -814,12 +782,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // Emit 'group-call-force-muted' to other participants in the call
     for (const peerId of groupCall.participants) {
       if (peerId === userId) continue;
-      const peerSocketId = this.activeUsers.get(peerId);
-      if (peerSocketId) {
-        this.server.to(peerSocketId).emit('group-call-force-muted', {
-          conversationId: data.conversationId,
-        });
-      }
+      this.sendToUser(peerId, 'group-call-force-muted', {
+        conversationId: data.conversationId,
+      });
     }
   }
 }

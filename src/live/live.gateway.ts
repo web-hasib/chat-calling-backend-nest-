@@ -83,8 +83,10 @@ export class LiveGateway implements OnGatewayConnection, OnGatewayDisconnect {
   handleDisconnect(client: Socket) {
     const userId = client.data.userId;
     if (userId) {
-      this.activeUsers.delete(userId);
-      this.cleanupLiveUser(userId);
+      if (this.activeUsers.get(userId) === client.id) {
+        this.activeUsers.delete(userId);
+        this.cleanupLiveUser(userId);
+      }
     }
   }
 
