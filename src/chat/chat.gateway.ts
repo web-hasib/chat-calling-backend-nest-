@@ -287,10 +287,12 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @SubscribeMessage('accept-call')
   handleAcceptCall(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { to: string; answer: any }
+    @MessageBody() data: { to: string; answer: any; receiverName?: string; receiverAvatar?: string }
   ) {
     this.sendToUser(data.to, 'call-accepted', {
       answer: data.answer,
+      receiverName: data.receiverName,
+      receiverAvatar: data.receiverAvatar,
     });
   }
 
@@ -332,6 +334,20 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         this.server.emit(`message-${data.conversationId}`, res.systemMessage);
         this.server.emit('new-message-notification', res.systemMessage);
       }
+    });
+  }
+
+  @SubscribeMessage('call-media-state')
+  handleCallMediaState(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { to: string; videoEnabled?: boolean; audioEnabled?: boolean; isScreenSharing?: boolean }
+  ) {
+    const fromUserId = client.data.userId;
+    this.sendToUser(data.to, 'call-media-state', {
+      from: fromUserId,
+      videoEnabled: data.videoEnabled,
+      audioEnabled: data.audioEnabled,
+      isScreenSharing: data.isScreenSharing,
     });
   }
 
