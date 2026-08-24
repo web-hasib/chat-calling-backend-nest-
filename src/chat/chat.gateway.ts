@@ -391,6 +391,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       messages: [],
     });
 
+    // Join Socket.io room for instantaneous in-call messaging and reactions
+    client.join(`group-call-${data.conversationId}`);
+
     // Fetch initiator details
     const initiator = conversation.participants.find((p: any) => p.userId === userId);
     const initiatorName = initiator?.user?.name || initiator?.nickname || 'Someone';
@@ -437,16 +440,25 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const userId = client.data.userId;
     if (!userId) return;
 
-    const groupCall = this.activeGroupCalls.get(data.conversationId);
+    let groupCall = this.activeGroupCalls.get(data.conversationId);
     if (!groupCall) {
-      client.emit('group-call-error', { reason: 'No active group call found.' });
-      return;
+      // Auto-recover group call state if needed
+      groupCall = {
+        type: data.type || 'VIDEO',
+        participants: new Set<string>(),
+        startedAt: Date.now(),
+        messages: [],
+      };
+      this.activeGroupCalls.set(data.conversationId, groupCall);
     }
 
     if (groupCall.participants.size >= this.MAX_GROUP_CALL_PARTICIPANTS) {
       client.emit('group-call-error', { reason: `Group call is full (max ${this.MAX_GROUP_CALL_PARTICIPANTS} participants).` });
       return;
     }
+
+    // Join Socket.io room for instantaneous in-call messaging and reactions
+    client.join(`group-call-${data.conversationId}`);
 
     // Fetch joiner details
     const conversation = await this.chatService.getConversation(data.conversationId);
@@ -558,30 +570,32 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (!userId) return;
 
     const groupCall = this.activeGroupCalls.get(data.conversationId);
-    if (!groupCall) return;
+    if (groupCall) {
+      groupCall.participants.delete(userId);
 
-    groupCall.participants.delete(userId);
-
-    // Notify remaining participants
-    for (const peerId of groupCall.participants) {
-      this.sendToUser(peerId, 'group-call-user-left', {
-        userId,
-        conversationId: data.conversationId,
-      });
-    }
-
-    // If call is now empty or only 1 person left, end it completely
-    if (groupCall.participants.size <= 1) {
-      for (const lastPeerId of groupCall.participants) {
-        this.sendToUser(lastPeerId, 'group-call-ended', {
+      // Notify remaining participants
+      for (const peerId of groupCall.participants) {
+        this.sendToUser(peerId, 'group-call-user-left', {
+          userId,
           conversationId: data.conversationId,
         });
       }
-      this.activeGroupCalls.delete(data.conversationId);
 
-      // Log the completed group call
-      await this.chatService.logGroupCall(userId, data.conversationId, groupCall.type, 'COMPLETED', data.duration || 0);
+      // If call is now empty or only 1 person left, end it completely
+      if (groupCall.participants.size <= 1) {
+        for (const lastPeerId of groupCall.participants) {
+          this.sendToUser(lastPeerId, 'group-call-ended', {
+            conversationId: data.conversationId,
+          });
+        }
+        this.activeGroupCalls.delete(data.conversationId);
+
+        // Log the completed group call
+        await this.chatService.logGroupCall(userId, data.conversationId, groupCall.type, 'COMPLETED', data.duration || 0);
+      }
     }
+
+    client.leave(`group-call-${data.conversationId}`);
 
     // Broadcast updated status
     this.broadcastGroupCallStatus(data.conversationId);
@@ -627,18 +641,14 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const userId = client.data.userId;
     if (!userId) return;
 
-    const groupCall = this.activeGroupCalls.get(data.conversationId);
-    if (!groupCall) return;
+    const payload = {
+      userId,
+      emoji: data.emoji,
+      conversationId: data.conversationId,
+    };
 
-    // Relay to other participants
-    for (const peerId of groupCall.participants) {
-      if (peerId === userId) continue;
-      this.sendToUser(peerId, 'group-call-emoji-received', {
-        userId,
-        emoji: data.emoji,
-        conversationId: data.conversationId,
-      });
-    }
+    // Broadcast to room exactly once
+    client.to(`group-call-${data.conversationId}`).emit('group-call-emoji-received', payload);
   }
 
   /**
@@ -647,15 +657,28 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @SubscribeMessage('group-call-chat-message')
   async handleGroupCallChatMessage(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { conversationId: string; message: string; senderName: string }
+    @MessageBody() data: { id?: string; conversationId: string; message: string; senderName: string }
   ) {
     const userId = client.data.userId;
     if (!userId) return;
 
-    const groupCall = this.activeGroupCalls.get(data.conversationId);
-    if (!groupCall) return;
+    let groupCall = this.activeGroupCalls.get(data.conversationId);
+    if (!groupCall) {
+      groupCall = {
+        type: 'VIDEO',
+        participants: new Set<string>([userId]),
+        startedAt: Date.now(),
+        messages: [],
+      };
+      this.activeGroupCalls.set(data.conversationId, groupCall);
+    } else {
+      groupCall.participants.add(userId);
+    }
+
+    client.join(`group-call-${data.conversationId}`);
 
     const msg = {
+      id: data.id || `${userId}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
       senderId: userId,
       senderName: data.senderName,
       message: data.message,
@@ -664,11 +687,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     };
     groupCall.messages.push(msg);
 
-    // Relay to other participants
-    for (const peerId of groupCall.participants) {
-      if (peerId === userId) continue;
-      this.sendToUser(peerId, 'group-call-chat-message-received', msg);
-    }
+    // Broadcast to Socket.io room (instantly reaches all other peers in meeting exactly once)
+    client.to(`group-call-${data.conversationId}`).emit('group-call-chat-message-received', msg);
   }
 
   /**
@@ -682,22 +702,18 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const userId = client.data.userId;
     if (!userId) return;
 
-    const groupCall = this.activeGroupCalls.get(data.conversationId);
-    if (!groupCall) return;
+    const payload = {
+      userId,
+      videoEnabled: data.videoEnabled,
+      audioEnabled: data.audioEnabled,
+      handRaised: data.handRaised,
+      footRaised: data.footRaised,
+      isScreenSharing: data.isScreenSharing,
+      conversationId: data.conversationId,
+    };
 
-    // Relay to other participants
-    for (const peerId of groupCall.participants) {
-      if (peerId === userId) continue;
-      this.sendToUser(peerId, 'group-call-media-state-received', {
-        userId,
-        videoEnabled: data.videoEnabled,
-        audioEnabled: data.audioEnabled,
-        handRaised: data.handRaised,
-        footRaised: data.footRaised,
-        isScreenSharing: data.isScreenSharing,
-        conversationId: data.conversationId,
-      });
-    }
+    // Broadcast to room exactly once
+    client.to(`group-call-${data.conversationId}`).emit('group-call-media-state-received', payload);
   }
 
   /**
@@ -721,12 +737,20 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       return;
     }
 
-    // Emit 'group-call-force-muted' to the target user if they are in the call
+    // 1. Emit 'group-call-force-muted' to the target user
     if (groupCall.participants.has(data.targetUserId)) {
       this.sendToUser(data.targetUserId, 'group-call-force-muted', {
         conversationId: data.conversationId,
+        byUserId: userId,
       });
     }
+
+    // 2. Broadcast media state update to everyone in the room
+    this.server.to(`group-call-${data.conversationId}`).emit('group-call-media-state-received', {
+      userId: data.targetUserId,
+      audioEnabled: false,
+      conversationId: data.conversationId,
+    });
   }
 
   /**
@@ -750,12 +774,20 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       return;
     }
 
-    // Emit 'group-call-force-unmuted' to the target user if they are in the call
+    // 1. Emit 'group-call-force-unmuted' to the target user
     if (groupCall.participants.has(data.targetUserId)) {
       this.sendToUser(data.targetUserId, 'group-call-force-unmuted', {
         conversationId: data.conversationId,
+        byUserId: userId,
       });
     }
+
+    // 2. Broadcast media state update to everyone in the room
+    this.server.to(`group-call-${data.conversationId}`).emit('group-call-media-state-received', {
+      userId: data.targetUserId,
+      audioEnabled: true,
+      conversationId: data.conversationId,
+    });
   }
 
   /**
@@ -779,10 +811,18 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       return;
     }
 
-    // Emit 'group-call-force-muted' to other participants in the call
+    // 1. Emit 'group-call-force-muted' to other participants in the call
     for (const peerId of groupCall.participants) {
       if (peerId === userId) continue;
       this.sendToUser(peerId, 'group-call-force-muted', {
+        conversationId: data.conversationId,
+        byUserId: userId,
+      });
+
+      // 2. Broadcast media state update
+      this.server.to(`group-call-${data.conversationId}`).emit('group-call-media-state-received', {
+        userId: peerId,
+        audioEnabled: false,
         conversationId: data.conversationId,
       });
     }

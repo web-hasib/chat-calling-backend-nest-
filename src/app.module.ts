@@ -7,6 +7,7 @@ import { AuthModule } from './auth/auth.module';
 import { StorageModule } from './storage/storage.module';
 import { ChatModule } from './chat/chat.module';
 import { LiveModule } from './live/live.module';
+import { AgoraModule } from './agora/agora.module';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { LiveModule } from './live/live.module';
     StorageModule,
     ChatModule,
     LiveModule,
+    AgoraModule,
   ],
   controllers: [AppController],
   providers: [AppService],
