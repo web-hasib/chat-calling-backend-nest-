@@ -8,8 +8,8 @@ export class AgoraService {
   private readonly appCertificate: string;
 
   constructor(private readonly configService: ConfigService) {
-    this.appId = this.configService.get<string>('AGORA_APP_ID') || process.env.AGORA_APP_ID || '';
-    this.appCertificate = this.configService.get<string>('AGORA_APP_CERTIFICATE') || process.env.AGORA_APP_CERTIFICATE || '';
+    this.appId = (this.configService.get<string>('AGORA_APP_ID') || process.env.AGORA_APP_ID || '').trim().replace(/^["']|["']$/g, '');
+    this.appCertificate = (this.configService.get<string>('AGORA_APP_CERTIFICATE') || process.env.AGORA_APP_CERTIFICATE || '').trim().replace(/^["']|["']$/g, '');
   }
 
   generateRtcToken(
@@ -40,6 +40,10 @@ export class AgoraService {
       expireTimeInSeconds,
       expireTimeInSeconds
     );
+
+    if (!token) {
+      throw new BadRequestException('Failed to generate Agora RTC token. Please check Agora App ID and Certificate validity.');
+    }
 
     return {
       token,

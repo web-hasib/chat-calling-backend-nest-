@@ -24,6 +24,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   // Track active socket connections by User ID (supports multiple tabs/devices)
   private activeUsers = new Map<string, Set<string>>(); // userId -> Set of socketIds
 
+  // Track active in-call status across devices: userId -> { socketId, type }
+  private userInCallSockets = new Map<string, { socketId: string; type: string }>();
+
   // Track active group calls: conversationId -> { type, participants, startedAt, messages }
   private activeGroupCalls = new Map<string, { type: 'AUDIO' | 'VIDEO'; participants: Set<string>; startedAt: number; messages: any[] }>();
   private readonly MAX_GROUP_CALL_PARTICIPANTS: number;
@@ -49,6 +52,22 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     return false;
   }
 
+  /**
+   * Sync in-call status across all devices of a user
+   */
+  private syncUserInCallState(userId: string, inCall: boolean, activeSocketId?: string, type?: string) {
+    if (inCall && activeSocketId) {
+      this.userInCallSockets.set(userId, { socketId: activeSocketId, type: type || '1-1' });
+    } else {
+      this.userInCallSockets.delete(userId);
+    }
+    this.sendToUser(userId, 'user-device-call-sync', {
+      inCall,
+      socketId: activeSocketId || null,
+      type: type || null,
+    });
+  }
+
   async handleConnection(client: Socket) {
     try {
       const authHeader = client.handshake.headers.authorization || client.handshake.auth?.token;
@@ -72,6 +91,16 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       // Send list of currently online user IDs to the newly connected client
       client.emit('online-users-list', Array.from(this.activeUsers.keys()));
 
+      // If user is already active in a call on another device, notify this newly connected client
+      if (this.userInCallSockets.has(userId)) {
+        const currentCall = this.userInCallSockets.get(userId);
+        client.emit('user-device-call-sync', {
+          inCall: true,
+          socketId: currentCall.socketId,
+          type: currentCall.type,
+        });
+      }
+
       // Broadcast user online status to all connected clients
       this.server.emit('user-status', { userId, status: 'online' });
     } catch (e) {
@@ -82,6 +111,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   handleDisconnect(client: Socket) {
     const userId = client.data.userId;
     if (userId) {
+      if (this.userInCallSockets.get(userId)?.socketId === client.id) {
+        this.syncUserInCallState(userId, false);
+      }
+
       const userSockets = this.activeUsers.get(userId);
       if (userSockets) {
         userSockets.delete(client.id);
@@ -263,6 +296,22 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: { to: string; offer: any; type: 'AUDIO' | 'VIDEO'; conversationId: string; callerName?: string; callerAvatar?: string }
   ) {
     const fromUserId = client.data.userId;
+    if (!fromUserId) return;
+
+    // Check if caller is already active in a call on another device/tab
+    if (this.userInCallSockets.has(fromUserId) && this.userInCallSockets.get(fromUserId)?.socketId !== client.id) {
+      client.emit('call-failed', { reason: 'You are already in a call on another device.' });
+      return;
+    }
+
+    // Check if callee is already active in a call
+    if (this.userInCallSockets.has(data.to)) {
+      client.emit('call-failed', { reason: 'User is busy on another call.' });
+      return;
+    }
+
+    this.syncUserInCallState(fromUserId, true, client.id, '1-1');
+
     const sent = this.sendToUser(data.to, 'incoming-call', {
       from: fromUserId,
       offer: data.offer,
@@ -273,6 +322,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     });
 
     if (!sent) {
+      this.syncUserInCallState(fromUserId, false);
       client.emit('call-failed', { reason: 'User offline' });
       // Log missed call
       this.chatService.logCall(fromUserId, data.to, data.conversationId, data.type, 'MISSED', 0).then((res) => {
@@ -289,6 +339,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { to: string; answer: any; receiverName?: string; receiverAvatar?: string }
   ) {
+    const receiverId = client.data.userId;
+    if (receiverId) {
+      this.syncUserInCallState(receiverId, true, client.id, '1-1');
+    }
     this.sendToUser(data.to, 'call-accepted', {
       answer: data.answer,
       receiverName: data.receiverName,
@@ -311,8 +365,15 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { to: string; conversationId: string; type: 'AUDIO' | 'VIDEO'; reason?: string }
   ) {
-    this.sendToUser(data.to, 'call-rejected', { reason: data.reason });
     const userId = client.data.userId;
+    if (userId) {
+      this.syncUserInCallState(userId, false);
+    }
+    if (data.to) {
+      this.syncUserInCallState(data.to, false);
+    }
+
+    this.sendToUser(data.to, 'call-rejected', { reason: data.reason });
     const status = data.reason === 'busy' ? 'BUSY' : 'REJECTED';
     this.chatService.logCall(data.to, userId, data.conversationId, data.type, status, 0).then((res) => {
       if (res?.systemMessage) {
@@ -327,8 +388,15 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { to: string; conversationId: string; type: 'AUDIO' | 'VIDEO'; duration: number }
   ) {
-    this.sendToUser(data.to, 'call-ended', {});
     const userId = client.data.userId;
+    if (userId) {
+      this.syncUserInCallState(userId, false);
+    }
+    if (data.to) {
+      this.syncUserInCallState(data.to, false);
+    }
+
+    this.sendToUser(data.to, 'call-ended', {});
     this.chatService.logCall(userId, data.to, data.conversationId, data.type, 'COMPLETED', data.duration).then((res) => {
       if (res?.systemMessage) {
         this.server.emit(`message-${data.conversationId}`, res.systemMessage);
@@ -385,6 +453,12 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const userId = client.data.userId;
     if (!userId) return;
 
+    // Check if user is already active in a call on another device/tab
+    if (this.userInCallSockets.has(userId) && this.userInCallSockets.get(userId)?.socketId !== client.id) {
+      client.emit('group-call-error', { reason: 'You are already in a call on another device.' });
+      return;
+    }
+
     // Prevent duplicate group calls on the same conversation
     if (this.activeGroupCalls.has(data.conversationId)) {
       client.emit('group-call-error', { reason: 'A group call is already active in this conversation.' });
@@ -397,6 +471,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       client.emit('group-call-error', { reason: 'Invalid group conversation.' });
       return;
     }
+
+    this.syncUserInCallState(userId, true, client.id, 'GROUP');
 
     // Create group call room with initiator and current timestamp
     const startedAt = Date.now();
@@ -456,6 +532,12 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const userId = client.data.userId;
     if (!userId) return;
 
+    // Check if user is already active in a call on another device/tab
+    if (this.userInCallSockets.has(userId) && this.userInCallSockets.get(userId)?.socketId !== client.id) {
+      client.emit('group-call-error', { reason: 'You are already in a call on another device.' });
+      return;
+    }
+
     let groupCall = this.activeGroupCalls.get(data.conversationId);
     if (!groupCall) {
       // Auto-recover group call state if needed
@@ -472,6 +554,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       client.emit('group-call-error', { reason: `Group call is full (max ${this.MAX_GROUP_CALL_PARTICIPANTS} participants).` });
       return;
     }
+
+    this.syncUserInCallState(userId, true, client.id, 'GROUP');
 
     // Join Socket.io room for instantaneous in-call messaging and reactions
     client.join(`group-call-${data.conversationId}`);
@@ -584,6 +668,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     const userId = client.data.userId;
     if (!userId) return;
+
+    this.syncUserInCallState(userId, false);
 
     const groupCall = this.activeGroupCalls.get(data.conversationId);
     if (groupCall) {
