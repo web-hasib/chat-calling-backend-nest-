@@ -53,6 +53,20 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   /**
+   * Helper to broadcast an event to other sockets of the same user (excluding sender socket)
+   */
+  private sendToOtherSocketsOfUser(userId: string, senderSocketId: string, event: string, payload: any): void {
+    const sockets = this.activeUsers.get(userId);
+    if (sockets && sockets.size > 0) {
+      for (const socketId of sockets) {
+        if (socketId !== senderSocketId) {
+          this.server.to(socketId).emit(event, payload);
+        }
+      }
+    }
+  }
+
+  /**
    * Sync in-call status across all devices of a user
    */
   private syncUserInCallState(userId: string, inCall: boolean, activeSocketId?: string, type?: string) {
@@ -342,6 +356,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const receiverId = client.data.userId;
     if (receiverId) {
       this.syncUserInCallState(receiverId, true, client.id, '1-1');
+      this.sendToOtherSocketsOfUser(receiverId, client.id, 'incoming-call-handled-elsewhere', { action: 'accepted' });
     }
     this.sendToUser(data.to, 'call-accepted', {
       answer: data.answer,
@@ -368,6 +383,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const userId = client.data.userId;
     if (userId) {
       this.syncUserInCallState(userId, false);
+      this.sendToOtherSocketsOfUser(userId, client.id, 'incoming-call-handled-elsewhere', { action: 'rejected' });
     }
     if (data.to) {
       this.syncUserInCallState(data.to, false);
@@ -594,6 +610,12 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       messages: groupCall.messages,
     });
 
+    // Notify other sockets of this user that call was joined on this device
+    this.sendToOtherSocketsOfUser(userId, client.id, 'group-call-handled-elsewhere', {
+      conversationId: data.conversationId,
+      action: 'joined',
+    });
+
     // Notify existing participants that a new user joined
     for (const peerId of existingParticipantIds) {
       this.sendToUser(peerId, 'group-call-user-joined', {
@@ -711,7 +733,13 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { conversationId: string }
   ) {
-    // Just a decline/reject.
+    const userId = client.data.userId;
+    if (userId) {
+      this.sendToOtherSocketsOfUser(userId, client.id, 'group-call-handled-elsewhere', {
+        conversationId: data.conversationId,
+        action: 'rejected',
+      });
+    }
   }
 
   /**
