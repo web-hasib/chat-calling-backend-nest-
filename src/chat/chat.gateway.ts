@@ -782,6 +782,31 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   /**
+   * Relays Discord-like soundboard reaction with audio & emoji to all users in group call.
+   */
+  @SubscribeMessage('group-call-soundboard')
+  handleGroupCallSoundboard(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { conversationId: string; soundId: string; name: string; emoji: string; audioData?: string }
+  ) {
+    const userId = client.data.userId;
+    if (!userId) return;
+
+    const payload = {
+      userId,
+      soundId: data.soundId,
+      name: data.name,
+      emoji: data.emoji,
+      audioData: data.audioData,
+      conversationId: data.conversationId,
+      id: Date.now() + Math.random(),
+    };
+
+    // Broadcast to everyone in room including or excluding sender
+    client.to(`group-call-${data.conversationId}`).emit('group-call-soundboard-received', payload);
+  }
+
+  /**
    * Relays an ephemeral chat message to all users in the group call.
    */
   @SubscribeMessage('group-call-chat-message')
